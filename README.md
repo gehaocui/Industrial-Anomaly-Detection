@@ -1,214 +1,435 @@
-# Towards Total Recall in Industrial Anomaly Detection
+# Industrial Anomaly Detection with Severity Estimation
 
-This repository contains the implementation for `PatchCore` as proposed in Roth et al. (2021), <https://arxiv.org/abs/2106.08265>.
+Industrial visual anomaly detection based on **PatchCore**, extended with **normal-sample-calibrated defect severity estimation**.
 
-It also provides various pretrained models that can achieve up to _99.6%_ image-level anomaly
-detection AUROC, _98.4%_ pixel-level anomaly localization AUROC and _>95%_ PRO score (although the
-later metric is not included for license reasons).
+This project builds on the original PatchCore implementation from Amazon Science and adds a severity analysis layer that converts anomaly detection outputs into interpretable defect severity scores and levels.
 
-![defect_segmentation](images/patchcore_defect_segmentation.png)
+## Overview
 
-_For questions & feedback, please reach out to karsten.rh1@gmail.com!_
+PatchCore is an unsupervised industrial anomaly detection method that learns a memory bank of normal image patch features and identifies anomalous regions through nearest-neighbor feature distances.
 
----
+The original PatchCore pipeline provides:
 
-## Quick Guide
+* Image-level anomaly scores
+* Pixel-level anomaly localization
+* Anomaly heatmaps
 
-First, clone this repository and set the `PYTHONPATH` environment variable with `env PYTHONPATH=src python bin/run_patchcore.py`.
-To train PatchCore on MVTec AD (as described below), run
+This project extends the pipeline with:
 
-```
-datapath=/path_to_mvtec_folder/mvtec datasets=('bottle' 'cable' 'capsule' 'carpet' 'grid' 'hazelnut'
-'leather' 'metal_nut' 'pill' 'screw' 'tile' 'toothbrush' 'transistor' 'wood' 'zipper')
-dataset_flags=($(for dataset in "${datasets[@]}"; do echo '-d '$dataset; done))
+* Defect severity estimation
+* Normal-only anomaly score calibration
+* LOW / MEDIUM / HIGH severity classification
+* Defect area and anomaly intensity analysis
+* A `predict_with_severity()` inference interface
+* Experimental evaluation on the MVTec AD Bottle dataset
 
+## Pipeline
 
-python bin/run_patchcore.py --gpu 0 --seed 0 --save_patchcore_model \
---log_group IM224_WR50_L2-3_P01_D1024-1024_PS-3_AN-1_S0 --log_online --log_project MVTecAD_Results results \
-patch_core -b wideresnet50 -le layer2 -le layer3 --faiss_on_gpu \
---pretrain_embed_dimension 1024  --target_embed_dimension 1024 --anomaly_scorer_num_nn 1 --patchsize 3 \
-sampler -p 0.1 approx_greedy_coreset dataset --resize 256 --imagesize 224 "${dataset_flags[@]}" mvtec $datapath
-```
-
-which runs PatchCore on MVTec images of sizes 224x224 using a WideResNet50-backbone pretrained on
-ImageNet. For other sample runs with different backbones, larger images or ensembles, see
-`sample_training.sh`.
-
-Given a pretrained PatchCore model (or models for all MVTec AD subdatasets), these can be evaluated using
-
-```shell
-datapath=/path_to_mvtec_folder/mvtec
-loadpath=/path_to_pretrained_patchcores_models
-modelfolder=IM224_WR50_L2-3_P001_D1024-1024_PS-3_AN-1_S0
-savefolder=evaluated_results'/'$modelfolder
-
-datasets=('bottle'  'cable'  'capsule'  'carpet'  'grid'  'hazelnut' 'leather'  'metal_nut'  'pill' 'screw' 'tile' 'toothbrush' 'transistor' 'wood' 'zipper')
-dataset_flags=($(for dataset in "${datasets[@]}"; do echo '-d '$dataset; done))
-model_flags=($(for dataset in "${datasets[@]}"; do echo '-p '$loadpath'/'$modelfolder'/models/mvtec_'$dataset; done))
-
-python bin/load_and_evaluate_patchcore.py --gpu 0 --seed 0 $savefolder \
-patch_core_loader "${model_flags[@]}" --faiss_on_gpu \
-dataset --resize 366 --imagesize 320 "${dataset_flags[@]}" mvtec $datapath
-```
-
-A set of pretrained PatchCores are hosted here: __add link__. To use them (and replicate training),
-check out `sample_evaluation.sh` and `sample_training.sh`.
-
----
-
-## In-Depth Description
-
-### Requirements
-
-Our results were computed using Python 3.8, with packages and respective version noted in
-`requirements.txt`. In general, the majority of experiments should not exceed 11GB of GPU memory;
-however using significantly large input images will incur higher memory cost.
-
-### Setting up MVTec AD
-
-To set up the main MVTec AD benchmark, download it from here: <https://www.mvtec.com/company/research/datasets/mvtec-ad>.
-Place it in some location `datapath`. Make sure that it follows the following data tree:
-
-```shell
-mvtec
-|-- bottle
-|-----|----- ground_truth
-|-----|----- test
-|-----|--------|------ good
-|-----|--------|------ broken_large
-|-----|--------|------ ...
-|-----|----- train
-|-----|--------|------ good
-|-- cable
-|-- ...
+```text
+Normal Training Images
+        │
+        ▼
+Pretrained CNN Feature Extractor
+        │
+        ▼
+Patch Features
+        │
+        ▼
+PatchCore Memory Bank
+        │
+        ├──────────────────────┐
+        │                      │
+        ▼                      ▼
+ Test Image            Held-out Normal Images
+        │                      │
+        ▼                      ▼
+PatchCore Inference     Severity Calibration
+        │
+        ├── Anomaly Score
+        │
+        └── Anomaly Heatmap
+                 │
+                 ▼
+        Defect Severity Estimator
+                 │
+        ┌────────┼─────────┐
+        ▼        ▼         ▼
+      Area     Mean      Peak
+     Ratio   Intensity  Intensity
+        └────────┼─────────┘
+                 ▼
+        Local Severity Score
+                 │
+                 ×
+        Anomaly Confidence
+                 │
+                 ▼
+           Severity Score
+                 │
+                 ▼
+        LOW / MEDIUM / HIGH
 ```
 
-containing in total 15 subdatasets: `bottle`, `cable`, `capsule`, `carpet`, `grid`, `hazelnut`,
-`leather`, `metal_nut`, `pill`, `screw`, `tile`, `toothbrush`, `transistor`, `wood`, `zipper`.
+## Severity Estimation
 
-### "Training" PatchCore
+A first version of the severity estimator used only the normalized anomaly heatmap.
 
-PatchCore extracts a (coreset-subsampled) memory of pretrained, locally aggregated training patch features:
+Testing showed that this approach could incorrectly assign high severity to normal images because every anomaly map was independently normalized.
 
-![patchcore_architecture](images/architecture.png)
+The current implementation therefore introduces **normal-only calibration**.
 
-To do so, we have provided `bin/run_patchcore.py`, which uses `click` to manage and aggregate input
-arguments. This looks something like
+### 1. Normal Score Calibration
 
-```shell
-python bin/run_patchcore.py \
---gpu <gpu_id> --seed <seed> # Set GPU-id & reproducibility seed.
---save_patchcore_model # If set, saves the patchcore model(s).
---log_online # If set, logs results to a Weights & Biases account.
---log_group IM224_WR50_L2-3_P01_D1024-1024_PS-3_AN-1_S0 --log_project MVTecAD_Results results # Logging details: Name of the run & Name of the overall project folder.
+A set of held-out normal samples is passed through PatchCore.
 
-patch_core  # We now pass all PatchCore-related parameters.
--b wideresnet50  # Which backbone to use.
--le layer2 -le layer3 # Which layers to extract features from.
---faiss_on_gpu # If similarity-searches should be performed on GPU.
---pretrain_embed_dimension 1024  --target_embed_dimension 1024 # Dimensionality of features extracted from backbone layer(s) and final aggregated PatchCore Dimensionality
---anomaly_scorer_num_nn 1 --patchsize 3 # Num. nearest neighbours to use for anomaly detection & neighbourhoodsize for local aggregation.
+The upper normal boundary is defined using the 99th percentile of normal image anomaly scores:
 
-sampler # We now pass all the (Coreset-)subsampling parameters.
--p 0.1 approx_greedy_coreset # Subsampling percentage & exact subsampling method.
-
-dataset # We now pass all the Dataset-relevant parameters.
---resize 256 --imagesize 224 "${dataset_flags[@]}" mvtec $datapath # Initial resizing shape and final imagesize (centercropped) as well as the MVTec subdatasets to use.
+```text
+normal_threshold = percentile(normal_scores, 99)
 ```
 
-Note that `sample_runs.sh` contains exemplary training runs to achieve strong AD performance. Due to
-repository changes (& hardware differences), results may deviate slightly from those reported in the
-paper, but should generally be very close or even better. As mentioned previously, for re-use and
-replicability we have also provided several pretrained PatchCore models hosted at __add link__ -
-download the folder, extract, and pass the model of your choice to
-`bin/load_and_evaluate_patchcore.py` which showcases an exemplary evaluation process.
+An anomaly confidence value is then calculated from how far a test image exceeds the calibrated normal range:
 
-During (after) training, the following information will be stored:
-
-```shell
-|PatchCore model (if --save_patchcore_model is set)
-|-- models
-|-----|----- mvtec_bottle
-|-----|-----------|------- nnscorer_search_index.faiss
-|-----|-----------|------- patchcore_params.pkl
-|-----|----- mvtec_cable
-|-----|----- ...
-|-- results.csv # Contains performance for each subdataset.
-
-|Sample_segmentations (if --save_segmentation_images is set)
+```text
+confidence =
+clip(
+    (image_score - normal_threshold) / score_scale,
+    0,
+    1
+)
 ```
 
-In addition to the main training process, we have also included Weights-&-Biases logging, which
-allows you to log all training & test performances online to Weights-and-Biases servers
-(<https://wandb.ai>). To use that, include the `--log_online` flag and provide your W&B key in
-`run_patchcore.py > --log_wandb_key`.
+This prevents local heatmap noise in normal images from automatically producing high severity scores.
 
-Finally, due to the effectiveness and efficiency of PatchCore, we also incorporate the option to use
-an ensemble of backbone networks and network featuremaps. For this, provide the list of backbones to
-use (as listed in `/src/anomaly_detection/backbones.py`) with `-b <backbone` and, given their
-ordering, denote the layers to extract with `-le idx.<layer_name>`. An example with three different
-backbones would look something like
+### 2. Local Defect Severity
 
-```shell
-python bin/run_patchcore.py --gpu <gpu_id> --seed <seed> --save_patchcore_model --log_group <log_name> --log_online --log_project <log_project> results \
+The anomaly heatmap is robustly normalized using its 5th and 99th percentiles.
 
-patch_core -b wideresnet101 -b resnext101 -b densenet201 -le 0.layer2 -le 0.layer3 -le 1.layer2 -le 1.layer3 -le 2.features.denseblock2 -le 2.features.denseblock3 --faiss_on_gpu \
+Pixels above the anomaly threshold are treated as the estimated defect region.
 
---pretrain_embed_dimension 1024  --target_embed_dimension 384 --anomaly_scorer_num_nn 1 --patchsize 3 sampler -p 0.01 approx_greedy_coreset dataset --resize 256 --imagesize 224 "${dataset_flags[@]}" mvtec $datapath
+Three local characteristics are extracted:
 
+```text
+Defect Area Ratio
+Mean Anomaly Intensity
+Peak Anomaly Intensity
 ```
 
-When using `--save_patchcore_model`, in the case of ensembles, a respective ensemble of PatchCore parameters is stored.
+The local severity score is calculated as:
 
-### Evaluating a pretrained PatchCore model
-
-To evaluate a/our pretrained PatchCore model(s), run
-
-```shell
-python bin/load_and_evaluate_patchcore.py --gpu <gpu_id> --seed <seed> $savefolder \
-patch_core_loader "${model_flags[@]}" --faiss_on_gpu \
-dataset --resize 366 --imagesize 320 "${dataset_flags[@]}" mvtec $datapath
+```text
+Local Severity =
+0.20 × Area Component
++ 0.35 × Mean Intensity
++ 0.45 × Peak Intensity
 ```
 
-assuming your pretrained model locations to be contained in `model_flags`; one for each subdataset
-in `dataset_flags`. Results will then be stored in `savefolder`. Example model & dataset flags:
+The final severity score combines local defect information with the calibrated image-level anomaly confidence:
 
-```shell
-model_flags=('-p', 'path_to_mvtec_bottle_patchcore_model', '-p', 'path_to_mvtec_cable_patchcore_model', ...)
-dataset_flags=('-d', 'bottle', '-d', 'cable', ...)
+```text
+Severity Score =
+Local Severity × Anomaly Confidence
 ```
 
-### Expected performance of pretrained models
+The current severity levels are:
 
-While there may be minor changes in performance due to software & hardware differences, the provided
-pretrained models should achieve the performances provided in their respective `results.csv`-files.
-The mean performance (particularly for the baseline WR50 as well as the larger Ensemble model)
-should look something like:
-
-| Model | Mean AUROC | Mean Seg. AUROC | Mean PRO
-|---|---|---|---|
-| WR50-baseline | 99.2% | 98.1% | 94.4%
-| Ensemble | __99.6%__ | __98.2%__ | __94.9%__
-
-### Citing
-
-If you use the code in this repository, please cite
-
-```
-@misc{roth2021total,
-      title={Towards Total Recall in Industrial Anomaly Detection},
-      author={Karsten Roth and Latha Pemula and Joaquin Zepeda and Bernhard Schölkopf and Thomas Brox and Peter Gehler},
-      year={2021},
-      eprint={2106.08265},
-      archivePrefix={arXiv},
-      primaryClass={cs.CV}
-}
+```text
+LOW       Severity < 0.45
+MEDIUM    0.45 ≤ Severity < 0.70
+HIGH      Severity ≥ 0.70
 ```
 
-## Security
+The weighting and severity thresholds are currently heuristic rather than learned parameters.
 
-See [CONTRIBUTING](CONTRIBUTING.md#security-issue-notifications) for more information.
+## MVTec AD Bottle Evaluation
+
+The current portfolio experiment evaluates the extension on the **Bottle** category of MVTec AD.
+
+### Experimental Setup
+
+```text
+Backbone:              ResNet50
+Feature Layers:        layer2 + layer3
+Input Size:            224 × 224
+Patch Size:            3
+Nearest Neighbors:     1
+
+Normal Memory Samples: 32
+Calibration Samples:   32
+Test Images:           83
+```
+
+The 32 calibration images are normal samples that are separate from the normal images used to construct the PatchCore memory bank.
+
+## Results
+
+| Defect Type   | Images | Avg. PatchCore Score | Avg. Confidence | Avg. Severity | LOW | MEDIUM | HIGH |
+| ------------- | -----: | -------------------: | --------------: | ------------: | --: | -----: | ---: |
+| Good          |     20 |               0.1017 |          0.0048 |        0.0038 |  20 |      0 |    0 |
+| Broken Large  |     20 |               0.5319 |          1.0000 |        0.8148 |   0 |      0 |   20 |
+| Broken Small  |     22 |               0.5282 |          1.0000 |        0.7744 |   0 |      0 |   22 |
+| Contamination |     21 |               0.3897 |          0.9449 |        0.7737 |   1 |      2 |   18 |
+
+### Image-Level AUROC
+
+```text
+PatchCore Anomaly Score AUROC: 1.0000
+Severity Score AUROC:          1.0000
+```
+
+All three defect categories achieved a higher average severity score than normal Bottle images:
+
+```text
+Broken Large   0.8148 > Good 0.0038
+Broken Small   0.7744 > Good 0.0038
+Contamination  0.7737 > Good 0.0038
+```
+
+The full per-image results are available in:
+
+```text
+experiments/bottle_full_test.csv
+```
+
+> **Note:** These results represent the current evaluation configuration on the MVTec AD **Bottle category only**. They should not be interpreted as performance on the complete 15-category MVTec AD benchmark.
+
+## Key Extensions
+
+### Defect Severity Estimator
+
+Added:
+
+```text
+src/patchcore/severity.py
+```
+
+The module provides:
+
+```python
+SeverityResult(
+    severity_score,
+    severity_level,
+    defect_area_ratio,
+    mean_intensity,
+    peak_intensity,
+    anomaly_confidence,
+)
+```
+
+### Normal-Only Calibration
+
+Severity confidence is calibrated exclusively using normal samples, preserving the unsupervised nature of the anomaly detection pipeline.
+
+No defect labels are required for calibration.
+
+### Extended Inference API
+
+The original PatchCore API remains unchanged:
+
+```python
+scores, masks = model.predict(images)
+```
+
+A new interface adds severity analysis:
+
+```python
+scores, masks, severities = model.predict_with_severity(images)
+```
+
+For a DataLoader:
+
+```python
+scores, masks, severities, labels, masks_gt = (
+    model.predict_with_severity(test_loader)
+)
+```
+
+### Calibration Example
+
+```python
+normal_scores, _, _, _ = model.predict(
+    calibration_loader
+)
+
+model.severity_estimator.calibrate(
+    normal_scores
+)
+
+scores, masks, severities, labels, masks_gt = (
+    model.predict_with_severity(test_loader)
+)
+```
+
+## Project Structure
+
+```text
+Industrial-Anomaly-Detection/
+│
+├── bin/
+│   ├── run_patchcore.py
+│   └── load_and_evaluate_patchcore.py
+│
+├── src/
+│   └── patchcore/
+│       ├── backbones.py
+│       ├── common.py
+│       ├── datasets/
+│       ├── metrics.py
+│       ├── patchcore.py
+│       ├── sampler.py
+│       ├── severity.py
+│       └── utils.py
+│
+├── experiments/
+│   └── bottle_full_test.csv
+│
+├── images/
+├── models/
+├── requirements.txt
+├── LICENSE
+└── NOTICE
+```
+
+## Installation
+
+Clone the repository:
+
+```bash
+git clone https://github.com/gehaocui/Industrial-Anomaly-Detection.git
+cd Industrial-Anomaly-Detection
+```
+
+Install dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
+The project uses packages including:
+
+```text
+PyTorch
+Torchvision
+FAISS
+NumPy
+SciPy
+Scikit-learn
+Scikit-image
+Timm
+Matplotlib
+```
+
+When running project scripts directly, expose the source directory through `PYTHONPATH`:
+
+```bash
+PYTHONPATH=src python bin/run_patchcore.py ...
+```
+
+## Dataset
+
+The project is compatible with the **MVTec Anomaly Detection Dataset (MVTec AD)**.
+
+The expected directory structure is:
+
+```text
+datasets/
+└── mvtec_ad/
+    └── bottle/
+        ├── train/
+        │   └── good/
+        │
+        ├── test/
+        │   ├── good/
+        │   ├── broken_large/
+        │   ├── broken_small/
+        │   └── contamination/
+        │
+        └── ground_truth/
+```
+
+Datasets are excluded from Git tracking through `.gitignore`.
+
+Please download MVTec AD separately and follow its dataset license and usage requirements.
+
+## Why Severity Calibration Matters
+
+An important finding during development was that anomaly heatmap intensity alone is not sufficient for severity estimation.
+
+A normal image may contain relatively strong local variations even when its overall PatchCore anomaly score is low.
+
+For example, before calibration:
+
+```text
+GOOD severity:   ~0.88
+BROKEN severity: ~0.88
+```
+
+Both images were incorrectly classified as HIGH severity.
+
+After introducing normal-score calibration:
+
+```text
+GOOD
+PatchCore Score: 0.1136
+Confidence:      0.0000
+Severity:        0.0000
+Level:           LOW
+
+BROKEN LARGE
+PatchCore Score: 0.4623
+Confidence:      1.0000
+Severity:        ~0.87
+Level:           HIGH
+```
+
+This calibration step makes severity estimation depend on both:
+
+```text
+Is the image globally anomalous?
++
+How large and intense is the localized anomaly?
+```
+
+rather than relying only on independently normalized heatmaps.
+
+## Limitations
+
+The current severity estimator is an experimental extension.
+
+Current limitations include:
+
+* Severity weights are manually defined rather than learned.
+* LOW / MEDIUM / HIGH thresholds are heuristic.
+* Evaluation has currently been performed on the MVTec AD Bottle category.
+* MVTec AD provides anomaly categories but does not provide official defect severity labels.
+* Therefore, severity values should be interpreted as relative defect indicators rather than ground-truth industrial severity labels.
+
+Future work may include:
+
+* Evaluation across all MVTec AD categories
+* Learned severity calibration
+* Category-specific calibration
+* Threshold optimization
+* Interactive anomaly visualization
+* Real-time industrial inspection demos
+
+## Original PatchCore
+
+This repository is based on the official implementation of:
+
+**Towards Total Recall in Industrial Anomaly Detection**
+Karsten Roth, Latha Pemula, Joaquin Zepeda, Bernhard Schölkopf, Thomas Brox, Peter Gehler
+
+Original implementation:
+
+`amazon-science/patchcore-inspection`
+
+PatchCore is used here as the anomaly detection baseline. The defect severity estimation and normal-score calibration modules are extensions added in this repository.
+
+The original Git history, attribution, `LICENSE`, and `NOTICE` files are retained.
 
 ## License
 
-This project is licensed under the Apache-2.0 License.
+The PatchCore implementation is distributed under the **Apache License 2.0**.
+
+Please refer to the repository `LICENSE` and `NOTICE` files for details.
