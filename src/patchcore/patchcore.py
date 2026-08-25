@@ -183,13 +183,14 @@ class PatchCore(torch.nn.Module):
         if isinstance(data, torch.utils.data.DataLoader):
             return self._predict_dataloader(data)
         return self._predict(data)
-        
+           
     def predict_with_severity(self, data):
         """
         Run PatchCore inference and estimate defect severity.
 
         Original PatchCore outputs are preserved.
-        Severity is computed from the generated anomaly maps.
+        Severity is computed from both the image-level anomaly score
+        and the generated anomaly map.
         """
 
         if isinstance(data, torch.utils.data.DataLoader):
@@ -198,8 +199,11 @@ class PatchCore(torch.nn.Module):
             )
 
             severities = [
-                self.severity_estimator.analyze(mask)
-                for mask in masks
+                self.severity_estimator.analyze(
+                    mask,
+                    image_score=score,
+                )
+                for score, mask in zip(scores, masks)
             ]
 
             return (
@@ -213,8 +217,11 @@ class PatchCore(torch.nn.Module):
         scores, masks = self._predict(data)
 
         severities = [
-            self.severity_estimator.analyze(mask)
-            for mask in masks
+            self.severity_estimator.analyze(
+                mask,
+                image_score=score,
+            )
+            for score, mask in zip(scores, masks)
         ]
 
         return scores, masks, severities
