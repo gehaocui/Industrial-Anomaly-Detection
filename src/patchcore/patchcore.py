@@ -12,6 +12,7 @@ import patchcore
 import patchcore.backbones
 import patchcore.common
 import patchcore.sampler
+import patchcore.severity
 
 LOGGER = logging.getLogger(__name__)
 
@@ -22,6 +23,9 @@ class PatchCore(torch.nn.Module):
         super(PatchCore, self).__init__()
         self.device = device
 
+        self.severity_estimator = (
+            patchcore.severity.DefectSeverityEstimator()
+        )
     def load(
         self,
         backbone,
@@ -175,10 +179,40 @@ class PatchCore(torch.nn.Module):
 
         self.anomaly_scorer.fit(detection_features=[features])
 
-    def predict(self, data):
+    def predict_with_severity(self, data):
+        """
+        Run PatchCore inference and estimate defect severity.
+
+        Original PatchCore outputs are preserved.
+        Severity is computed from the generated anomaly maps.
+        """
+
         if isinstance(data, torch.utils.data.DataLoader):
-            return self._predict_dataloader(data)
-        return self._predict(data)
+            scores, masks, labels_gt, masks_gt = (
+                self._predict_dataloader(data)
+            )
+
+            severities = [
+                self.severity_estimator.analyze(mask)
+                for mask in masks
+            ]
+
+            return (
+                scores,
+                masks,
+                severities,
+                labels_gt,
+                masks_gt,
+            )
+
+        scores, masks = self._predict(data)
+
+        severities = [
+            self.severity_estimator.analyze(mask)
+            for mask in masks
+        ]
+
+        return scores, masks, severities
 
     def _predict_dataloader(self, dataloader):
         """This function provides anomaly scores/maps for full dataloaders."""
