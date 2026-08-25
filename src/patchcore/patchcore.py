@@ -179,6 +179,11 @@ class PatchCore(torch.nn.Module):
 
         self.anomaly_scorer.fit(detection_features=[features])
 
+    def predict(self, data):
+        if isinstance(data, torch.utils.data.DataLoader):
+            return self._predict_dataloader(data)
+        return self._predict(data)
+        
     def predict_with_severity(self, data):
         """
         Run PatchCore inference and estimate defect severity.
